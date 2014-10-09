@@ -6,7 +6,10 @@ use std::ptr;
 use std::c_str::CString;
 use std::finally::Finally;
 use std::collections::HashMap;
+use std::collections::hashmap;
 use std::mem::transmute;
+use std::sync;
+use std::comm;
 
 use libc::{c_char, c_int, c_void};
 
@@ -48,14 +51,14 @@ unsafe extern "C" fn tree_walk_cb(root: *const c_char,
 
 unsafe fn add_blame(blames: &mut HashMap<Vec<u8>, uint>,
                     path: *const c_char,
-                    repos: *mut git_repository,
-                    error: &mut Option<String>) {
+                    repos: *mut git_repository) -> Result<(), String> {
     let mut blame = ptr::null_mut();
-    println!("blame for {}", CString::new(path, false).as_str().unwrap());
     if git_blame_file(&mut blame, repos, path, ptr::null_mut()) != GIT_OK {
         let msg = CString::new((*giterr_last()).message as *const c_char, false);
-        *error = Some(msg.to_string());
-    } (|| {
+        return Err(msg.to_string());
+    }
+
+    return (|| {
 
     for i in range(0, git_blame_get_hunk_count(blame)) {
         let hunk = git_blame_get_hunk_byindex(blame, i);
@@ -64,9 +67,9 @@ unsafe fn add_blame(blames: &mut HashMap<Vec<u8>, uint>,
         let mut commit: *mut git_commit = ptr::null_mut();
         if git_commit_lookup(&mut commit, repos, &final_commit_id) != GIT_OK {
             let msg = CString::new((*giterr_last()).message as *const c_char, false);
-            *error = Some(msg.to_string());
-        if commit.is_null() { continue; }
+            return Err(msg.to_string());
         }
+        if commit.is_null() { continue; }
         (|| {
 
         let author = git_commit_author(commit as *const git_commit);
@@ -83,11 +86,12 @@ unsafe fn add_blame(blames: &mut HashMap<Vec<u8>, uint>,
         }).finally(||{ git_commit_free(commit); });
     }
 
+    return Ok(());
     }).finally(||{ git_blame_free(blame); });
 }
 
 unsafe fn do_the_thing() {
-    let mut blames = HashMap::new();
+    let mut blames = HashMap::<Vec<u8>, uint>::new();
     or_fail(git_threads_init()); (|| {
     let mut repos = ptr::null_mut();
     or_fail(git_repository_open(&mut repos, c_str!("."))); (|| {
@@ -107,7 +111,8 @@ unsafe fn do_the_thing() {
     }).finally(||{ git_reference_free(head); });
     (|| {
 
-    let mut error = None;
+    let mut work = Vec::new();
+
     git_tree_walk(tree as *const _, GIT_TREEWALK_PRE, Some(tree_walk_cb), (&mut |root, entry| {
         // i guess we shouldn't fail in here...
         let root = CString::new(root, false);
@@ -119,14 +124,49 @@ unsafe fn do_the_thing() {
             let mut path = Vec::with_capacity(root.len() + name.len());
             path.push_all(root);
             path.push_all(name);
-
-            add_blame(&mut blames, path.as_ptr() as *const c_char, repos, &mut error);
-            if error.is_some() { return -1 as c_int; }
+            work.push(path);
         }
 
         return 0 as c_int;
     }) as *mut _ as *mut c_void);
-    match error { Some(e) => fail!(e), _ => () }
+
+    let (tx, rx) = comm::channel();
+    let arc_work = sync::Arc::new(sync::RWLock::new(work));
+    static N_THREADS: int = 6;
+
+    for _ in range(0, N_THREADS) {
+        let arc_work = arc_work.clone();
+        let tx = tx.clone();
+        std::task::spawn(proc() {
+            let mut blames = HashMap::new();
+
+            loop {
+                let path = match arc_work.write().pop() {
+                    None => { tx.send(Ok(blames)); break; }
+                    Some(p) => { p }
+                };
+
+                let r = add_blame(&mut blames,
+                                  path.as_ptr() as *const c_char,
+                                  repos);
+                match r {
+                    Ok(()) => {}
+                    Err(e) => { tx.send(Err(e)); break; }
+                }
+            }
+        });
+    }
+
+    for _ in range(0, N_THREADS) {
+        let partial_blames = rx.recv().unwrap_or_else(|e| fail!(e));
+        for (author, lines) in partial_blames.into_iter() {
+            match blames.entry(author) {
+                hashmap::Occupied(mut e) => { *e.get_mut() += lines; }
+                hashmap::Vacant(e) => { e.set(lines); }
+            }
+        }
+    }
+
     }).finally(||{ git_tree_free(tree); });
     }).finally(||{ git_repository_free(repos); });
     }).finally(||{ git_threads_shutdown(); });
